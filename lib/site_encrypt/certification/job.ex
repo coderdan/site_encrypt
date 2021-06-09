@@ -17,6 +17,10 @@ defmodule SiteEncrypt.Certification.Job do
         Logger.error("Error obtaining certificate for #{hd(config.domains)}")
         :error
 
+      {:error, reason, _} ->
+        Logger.error("Error obtaining certificate for #{hd(config.domains)}, #{inspect(reason)}")
+        :error
+
       :ok ->
         SiteEncrypt.client(config).pems(config)
     end

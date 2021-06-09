@@ -38,13 +38,19 @@ defmodule SiteEncrypt.Acme.Client do
   apply the new certificate to the endpoint, you can pass the returned pems to the function
   `SiteEncrypt.set_certificate/2`.
   """
-  @spec create_certificate(API.session(), SiteEncrypt.id()) :: {SiteEncrypt.pems(), API.session()}
+  @spec create_certificate(API.session(), SiteEncrypt.id()) ::
+          {SiteEncrypt.pems(), API.session()} | {:error, String.t()}
   def create_certificate(session, id) do
     config = SiteEncrypt.Registry.config(id)
-    {:ok, order, session} = API.new_order(session, config.domains)
-    {private_key, order, session} = process_new_order(session, order, config)
-    {:ok, cert, chain, session} = API.get_cert(session, order)
-    {%{privkey: Crypto.private_key_to_pem(private_key), cert: cert, chain: chain}, session}
+
+    with {:ok, order, session} <- API.new_order(session, config.domains),
+         {private_key, order, session} <- process_new_order(session, order, config),
+         {:ok, cert, chain, session} <- API.get_cert(session, order) do
+      {%{privkey: Crypto.private_key_to_pem(private_key), cert: cert, chain: chain}, session}
+    else
+      {:error, error, session} ->
+        {:error, error, session}
+    end
   end
 
   defp start_session(directory_url, account_key, session_opts) do
@@ -52,6 +58,9 @@ defmodule SiteEncrypt.Acme.Client do
     session
   end
 
+  @spec process_new_order(API.session(), Map.t(), SiteEncrypt.config()) ::
+          {private_key :: String.t(), order :: Map.t(), API.session()}
+          | {:error, API.error(), API.session()}
   defp process_new_order(session, %{status: :pending} = order, config) do
     {pending, session} =
       Enum.reduce(
@@ -71,17 +80,21 @@ defmodule SiteEncrypt.Acme.Client do
     {pending_authorizations, pending_challenges} = Enum.unzip(pending)
     SiteEncrypt.Registry.await_challenges(config.id, pending_challenges, :timer.minutes(1))
 
-    {:ok, session} = poll(session, config, &validate_authorizations(&1, pending_authorizations))
+    with {:ok, session} <-
+           poll(session, config, &validate_authorizations(&1, pending_authorizations)) do
+      {order, session} =
+        poll(session, config, fn session ->
+          case API.order_status(session, order) do
+            {:ok, %{status: :ready} = order, session} -> {order, session}
+            {:ok, _, session} -> {nil, session}
+          end
+        end)
 
-    {order, session} =
-      poll(session, config, fn session ->
-        case API.order_status(session, order) do
-          {:ok, %{status: :ready} = order, session} -> {order, session}
-          {:ok, _, session} -> {nil, session}
-        end
-      end)
-
-    process_new_order(session, order, config)
+      process_new_order(session, order, config)
+    else
+      {:error, message} ->
+        {:error, message, session}
+    end
   end
 
   defp process_new_order(session, %{status: :ready} = order, config) do
@@ -122,11 +135,13 @@ defmodule SiteEncrypt.Acme.Client do
   defp validate_authorizations(session, []), do: {:ok, session}
 
   defp validate_authorizations(session, [authorization | other_authorizations]) do
-    {:ok, challenges, session} = API.authorization(session, authorization)
-
-    if Enum.any?(challenges, &(&1.status == :valid)),
-      do: validate_authorizations(session, other_authorizations),
-      else: {nil, session}
+    with {:ok, challenges, session} <- API.authorization(session, authorization) do
+      if Enum.any?(challenges, &(&1.status == :valid)) do
+        validate_authorizations(session, other_authorizations)
+      else
+        {nil, session}
+      end
+    end
   end
 
   defp poll(session, config, operation) do
@@ -138,7 +153,9 @@ defmodule SiteEncrypt.Acme.Client do
     )
   end
 
-  defp poll(session, _operation, 0, _), do: {:error, session}
+  defp poll(session, _operation, 0, _) do
+    {:error, "Operation failed after multiple attempts", session}
+  end
 
   defp poll(session, operation, attempt, delay) do
     with {nil, session} <- operation.(session) do
