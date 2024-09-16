@@ -13,7 +13,6 @@ defmodule SiteEncrypt.Acme.Client.API do
   any resources open, so you can safely use it from multiple processes.
   """
   alias SiteEncrypt.HttpClient
-  alias SiteEncrypt.HttpClient
   alias SiteEncrypt.Acme.Client.Crypto
 
   defmodule Session do
@@ -42,7 +41,7 @@ defmodule SiteEncrypt.Acme.Client.API do
           revoke_cert: String.t()
         }
 
-  @type error :: Mint.Types.error() | HTTP.response()
+  @type error :: Mint.Types.error() | HTTP.response() | term()
 
   @type order :: %{
           :status => status,
@@ -98,7 +97,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Creates the new account at the CA server."
-  @spec new_account(session, [String.t()]) :: {:ok, session} | {:error, error}
+  @spec new_account(session, [String.t()]) :: {:ok, session} | {:error, error, session}
   def new_account(session, emails) do
     url = session.directory.new_account
     payload = %{"contact" => Enum.map(emails, &"mailto:#{&1}"), "termsOfServiceAgreed" => true}
@@ -115,7 +114,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   You only need to invoke this function if the session is created using the key of the existing
   account.
   """
-  @spec fetch_kid(session) :: {:ok, session} | {:error, error}
+  @spec fetch_kid(session) :: {:ok, session} | {:error, error, session}
   def fetch_kid(session) do
     url = session.directory.new_account
     payload = %{"onlyReturnExisting" => true}
@@ -127,7 +126,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Creates a new order on the CA server."
-  @spec new_order(session, [String.t()]) :: {:ok, order, session} | {:error, error}
+  @spec new_order(session, [String.t()]) :: {:ok, order, session} | {:error, error, session}
   def new_order(session, domains) do
     payload = %{"identifiers" => Enum.map(domains, &%{"type" => "dns", "value" => &1})}
 
@@ -146,7 +145,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Obtains the status of the given order."
-  @spec order_status(session, order) :: {:ok, order, session} | {:error, error}
+  @spec order_status(session, order) :: {:ok, order, session} | {:error, error, session}
   def order_status(session, order) do
     with {:ok, response, session} <- jws_request(session, :post, order.location, :kid) do
       result =
@@ -159,7 +158,8 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Obtains authorization challenges from the CA."
-  @spec authorization(session, String.t()) :: {:ok, [challenge], session}
+  @spec authorization(session, String.t()) ::
+          {:ok, [challenge], session} | {:error, error, session}
   def authorization(session, authorization) do
     with {:ok, response, session} <- jws_request(session, :post, authorization, :kid) do
       challenges =
@@ -174,7 +174,7 @@ defmodule SiteEncrypt.Acme.Client.API do
 
   @doc "Returns the status and the token of the http-01 challenge."
   @spec challenge(session, challenge) ::
-          {:ok, %{status: status, token: String.t()}, session} | {:error, error}
+          {:ok, %{status: status, token: String.t()}, session} | {:error, error, session}
   def challenge(session, challenge) do
     payload = %{}
 
@@ -189,7 +189,8 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Finalizes the given order."
-  @spec finalize(session, order, binary) :: {:ok, %{status: status}, session} | {:error, error}
+  @spec finalize(session, order, binary) ::
+          {:ok, %{status: status}, session} | {:error, error, session}
   def finalize(session, order, csr) do
     payload = %{"csr" => Base.url_encode64(csr, padding: false)}
 
@@ -204,7 +205,8 @@ defmodule SiteEncrypt.Acme.Client.API do
   end
 
   @doc "Obtains the certificate and chain from a finalized order."
-  @spec get_cert(session, order) :: {:ok, String.t(), String.t(), session} | {:error, error}
+  @spec get_cert(session, order) ::
+          {:ok, String.t(), String.t(), session} | {:error, error, session}
   def get_cert(session, order) do
     with {:ok, response, session} <- jws_request(session, :post, order.certificate, :kid) do
       [cert | chain] = String.split(response.body, ~r/^\-+END CERTIFICATE\-+$\K/m, parts: 2)
@@ -224,6 +226,8 @@ defmodule SiteEncrypt.Acme.Client.API do
     )
   end
 
+  @spec jws_request(session, String.t(), String.t(), term(), String.t()) ::
+          {:ok, HTTPClient.response(), session} | {:error, error, session}
   defp jws_request(session, verb, url, id_field, payload \\ "") do
     with {:ok, session} <- get_nonce(session) do
       headers = [{"content-type", "application/jose+json"}]
@@ -243,10 +247,15 @@ defmodule SiteEncrypt.Acme.Client.API do
     end
   end
 
+  @spec get_nonce(session) :: {:ok, session} | {:error, error, session}
   defp get_nonce(%Session{nonce: nil} = session) do
     with {response, session} <- http_request(session, :head, session.directory.new_nonce),
-         :ok <- validate_response(response),
-         do: {:ok, session}
+         :ok <- validate_response(response) do
+      {:ok, session}
+    else
+      {:error, response} ->
+        {:error, response, session}
+    end
   end
 
   defp get_nonce(session), do: {:ok, session}
@@ -270,6 +279,8 @@ defmodule SiteEncrypt.Acme.Client.API do
 
   defp id_map(:kid, session), do: %{"kid" => session.kid}
 
+  @spec http_request(session, String.t(), String.t(), Keyword.t()) ::
+          {HTTPClient.response(), session}
   defp http_request(session, verb, url, opts \\ []) do
     opts =
       opts
